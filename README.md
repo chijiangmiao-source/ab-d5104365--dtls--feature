@@ -55,6 +55,7 @@ docker compose up --exit-code-from verify
 | `GET` | `/` | 审计页面 |
 | `POST` | `/api/audit` | 提交捕获并冻结裁决（替换同标识旧裁决） |
 | `GET` | `/api/audit/{audit_id}` | 重新打开冻结裁决 |
+| `GET` | `/api/audit/{audit_id}/record/{index}/trace` | 追溯某条已出现记录的占位证据（取自冻结时逐记录快照） |
 
 `POST /api/audit` 请求体：
 
@@ -70,6 +71,27 @@ docker compose up --exit-code-from verify
 响应即冻结裁决：`ok`、`first_violation{record_index,kind,offset,message}`、
 逐记录裁定（epoch/seq/replay/auth/窗口前后/摘要/违规）与最终接收状态
 （当前 epoch、推进次数、各 epoch 窗口）。
+
+### 占位证据追溯
+
+`GET /api/audit/{audit_id}/record/{index}/trace` 从冻结裁决中取出该记录在
+**裁决当时**的占位证据，证据只来自该记录自身冻结的 `window_before` 逐记录
+快照，绝不以最终窗口倒推：
+
+- `epoch` / `seq` / `replay` / `auth`：所属 epoch、恢复后的完整序号、裁定与认证结果
+- `adjudication_window{epoch,highest,bitmap,lower_bound,window_size}`：裁决时该
+  epoch 的最高序号、64 位位图及窗口下界 `highest-63`
+- `distance`：裁决时 `highest - seq`
+- `bit_evidence{within_window,bit_offset,bit_value}`：该记录对应窗口位的占位证据
+- 重复（`replay="duplicate"`）：`bit_value=1`，`originator{record_index,epoch,
+  seq,auth="ok"}` 指出最先使该位有效的、已认证通过的原始记录
+- 过旧（`replay="too_old"`）给出裁决时最高序号、相差值与窗口下界，
+  `bit_evidence.within_window=false` 且**不返回/不伪造任何占位记录**
+- 新到记录与认证失败记录返回 `traceable_placeholder=false` 与明确说明，
+  表示没有可追溯的重复占位
+
+窗口前移把旧位挤出后，重新追溯较早记录仍依据冻结快照返回原裁决（重复仍为
+重复、过旧仍为过旧），不受最终窗口影响。
 
 ## 违规类型与偏移约定
 

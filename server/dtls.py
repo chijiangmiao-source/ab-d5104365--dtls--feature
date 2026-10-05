@@ -397,6 +397,183 @@ class Receiver:
         }
 
 
+REASON_DUPLICATE = "duplicate_bit_occupied"
+REASON_TOO_OLD = "outside_window_too_old"
+REASON_NEW = "new_no_placeholder"
+REASON_AUTH_FAILED = "authentication_failed_no_placeholder"
+REASON_REJECTED = "rejected_after_adjudication_no_placeholder"
+REASON_NOT_ADJUDICATED = "replay_not_adjudicated"
+
+
+def _trace_auth_state(row: dict) -> str | None:
+    """Authentication outcome as exposed by the traceability view."""
+    if row.get("auth") is not None:
+        return row["auth"]
+    violation = row.get("violation")
+    if violation is not None and violation["kind"] == KIND_AUTHENTICATION:
+        return "failed"
+    return None
+
+
+def build_record_trace(row: dict,
+                       authed_origin: dict[tuple[int, int], int]) -> dict:
+    """Freeze the placeholder evidence for one record at adjudication time.
+
+    The evidence is derived strictly from the record's own frozen
+    ``window_before`` snapshot, never from the receive window's final state,
+    so a later window slide cannot rewrite an earlier duplicate/too-old call.
+    """
+    epoch = row.get("epoch")
+    seq = row.get("seq")
+    replay = row.get("replay")
+    trace = {
+        "record_index": row["index"],
+        "epoch": epoch,
+        "seq": seq,
+        "replay": replay,
+        "auth": _trace_auth_state(row),
+        "adjudication_window": None,
+        "bit_evidence": None,
+        "distance": None,
+        "originator": None,
+        "traceable_placeholder": False,
+        "reason": None,
+        "explanation": "",
+    }
+
+    snap = row.get("window_before")
+    if replay is None or snap is None:
+        trace["reason"] = REASON_NOT_ADJUDICATED
+        trace["explanation"] = (
+            "the record never reached replay adjudication (a parse/state "
+            "failure occurred before the receive window was consulted); no "
+            "duplicate placeholder can be traced"
+        )
+        return trace
+
+    highest = snap["highest"]
+    bitmap = int(snap["bitmap"], 16)
+    distance = highest - seq
+    lower_bound = highest - (WINDOW_BITS - 1)
+    trace["adjudication_window"] = {
+        "epoch": snap["epoch"],
+        "highest": highest,
+        "bitmap": snap["bitmap"],
+        "window_size": WINDOW_BITS,
+        "lower_bound": lower_bound,
+    }
+    trace["distance"] = distance
+
+    if replay == "duplicate":
+        bit_offset = distance  # 0 <= distance < 64 for a duplicate
+        bit_value = (bitmap >> bit_offset) & 1
+        trace["bit_evidence"] = {
+            "within_window": True,
+            "bit_offset": bit_offset,
+            "bit_value": bit_value,
+            "window_size": WINDOW_BITS,
+        }
+        origin_index = authed_origin.get((epoch, seq))
+        if origin_index is not None and bit_value == 1:
+            trace["originator"] = {
+                "record_index": origin_index,
+                "epoch": epoch,
+                "seq": seq,
+                "auth": "ok",
+            }
+            trace["traceable_placeholder"] = True
+            trace["reason"] = REASON_DUPLICATE
+            trace["explanation"] = (
+                f"frozen snapshot at adjudication time: highest sequence "
+                f"{highest}; bit {bit_offset} (highest - seq) of the 64-bit "
+                f"bitmap was 1. The bit was first set by authenticated "
+                f"record #{origin_index} (epoch {epoch}, full sequence "
+                f"{seq}, authentication ok); this record is its replay"
+            )
+        else:
+            # Defensive: classification and the frozen bitmap disagree.
+            trace["reason"] = REASON_DUPLICATE
+            trace["explanation"] = (
+                "adjudicated duplicate but the frozen bitmap does not yield "
+                "an authenticated originator in this submission"
+            )
+        return trace
+
+    if replay == "too_old":
+        trace["bit_evidence"] = {
+            "within_window": False,
+            "bit_offset": distance,
+            "bit_value": None,
+            "window_size": WINDOW_BITS,
+        }
+        trace["reason"] = REASON_TOO_OLD
+        trace["explanation"] = (
+            f"frozen snapshot at adjudication time: highest sequence "
+            f"{highest}; full sequence {seq} is {distance} behind, past the "
+            f"64-bit window lower bound {lower_bound} (the window covers "
+            f"[{lower_bound}, {highest}]). The corresponding bit is outside "
+            "the window, so no placeholder record is claimed or fabricated"
+        )
+        return trace
+
+    # replay == "new": the bit was unoccupied (or the seq ran ahead of the
+    # window); an AEAD failure leaves the window untouched, so neither case
+    # has a traceable duplicate placeholder.
+    if distance >= 0:
+        bit_value = (bitmap >> distance) & 1
+        trace["bit_evidence"] = {
+            "within_window": True,
+            "bit_offset": distance,
+            "bit_value": bit_value,
+            "window_size": WINDOW_BITS,
+        }
+        gap = f"bit {distance} of the frozen bitmap was {bit_value}"
+    else:
+        trace["bit_evidence"] = {
+            "within_window": False,
+            "bit_offset": None,
+            "bit_value": None,
+            "window_size": WINDOW_BITS,
+        }
+        gap = (f"the sequence ran ahead of the frozen highest {highest}")
+    if trace["auth"] == "failed":
+        trace["reason"] = REASON_AUTH_FAILED
+        trace["explanation"] = (
+            f"adjudicated new ({gap}) but AEAD authentication failed; the "
+            "window was never advanced and there is no duplicate placeholder "
+            "to trace"
+        )
+    elif trace["auth"] is None and row.get("violation") is not None:
+        trace["reason"] = REASON_REJECTED
+        trace["explanation"] = (
+            f"adjudicated new ({gap}) but the record was then rejected "
+            f"({row['violation']['kind']}); the window was never advanced and "
+            "there is no authenticated record occupying this bit, so no "
+            "duplicate placeholder can be traced"
+        )
+    else:
+        trace["reason"] = REASON_NEW
+        trace["explanation"] = (
+            f"adjudicated new at capture time ({gap}); there is no earlier "
+            "authenticated record occupying this bit, so no duplicate "
+            "placeholder can be traced"
+        )
+    return trace
+
+
+def build_record_traces(rows: list[dict]) -> None:
+    """Attach frozen placeholder evidence to every adjudicated row."""
+    # A window bit is only ever set after AEAD authentication, so the first
+    # authenticated record for each (epoch, seq) is the placeholder origin.
+    authed_origin: dict[tuple[int, int], int] = {}
+    for row in rows:
+        if (row.get("auth") == "ok" and row.get("epoch") is not None
+                and row.get("seq") is not None):
+            authed_origin.setdefault((row["epoch"], row["seq"]), row["index"])
+    for row in rows:
+        row["trace"] = build_record_trace(row, authed_origin)
+
+
 def run_audit(initial_epoch: int, traffic_secret: bytes,
               record_blobs: list[bytes]) -> dict:
     """Adjudicate a captured record sequence and produce the frozen verdict."""
@@ -409,6 +586,9 @@ def run_audit(initial_epoch: int, traffic_secret: bytes,
         rows.append(row)
         if row["violation"] is not None and first_violation is None:
             first_violation = {"record_index": index, **row["violation"]}
+    # Freeze per-record placeholder evidence from the individual snapshots;
+    # the final window state must never be back-projected onto old verdicts.
+    build_record_traces(rows)
     return {
         "ok": first_violation is None,
         "first_violation": first_violation,

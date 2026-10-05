@@ -12,6 +12,7 @@ from server.dtls import (
     Violation,
     parse_unified_header,
     reconstruct_seq,
+    run_audit,
 )
 from server.encode import key_update_record, seal_record
 
@@ -272,6 +273,111 @@ class ReceiverRuleTests(unittest.TestCase):
         row = rx.process_record(rec)
         self.assertEqual(row["violation"]["kind"], "authentication")
         self.assertIsNone(row["inner_type"])
+
+
+class TraceEvidenceTests(unittest.TestCase):
+    """Frozen per-record placeholder evidence for duplicate/too-old calls."""
+
+    def _audit(self, blobs):
+        return run_audit(3, SECRET3, blobs)
+
+    def test_duplicate_points_at_first_authenticated_originator(self):
+        v = self._audit([
+            appdata(SECRET3, 3, 5, b"a"),
+            appdata(SECRET3, 3, 3, b"b"),
+            appdata(SECRET3, 3, 3, b"b"),  # replay of record #1
+        ])
+        t = v["records"][2]["trace"]
+        self.assertEqual(t["replay"], "duplicate")
+        self.assertEqual(t["auth"], "skipped")
+        self.assertEqual(t["epoch"], 3)
+        self.assertEqual(t["seq"], 3)
+        # adjudication snapshot: highest 5, bitmap has bits 0 and 2 set
+        w = t["adjudication_window"]
+        self.assertEqual((w["highest"], w["epoch"]), (5, 3))
+        self.assertEqual(w["lower_bound"], 5 - 63)
+        self.assertEqual(t["distance"], 2)
+        self.assertEqual(t["bit_evidence"]["within_window"], True)
+        self.assertEqual(t["bit_evidence"]["bit_offset"], 2)
+        self.assertEqual(t["bit_evidence"]["bit_value"], 1)
+        self.assertTrue(t["traceable_placeholder"])
+        self.assertEqual(t["originator"],
+                         {"record_index": 1, "epoch": 3, "seq": 3, "auth": "ok"})
+
+    def test_too_old_gives_boundary_without_fabricated_placeholder(self):
+        v = self._audit([
+            appdata(SECRET3, 3, 64, b"hi"),
+            appdata(SECRET3, 3, 0, b"hi"),  # offset 64 -> expired
+        ])
+        t = v["records"][1]["trace"]
+        self.assertEqual(t["replay"], "too_old")
+        w = t["adjudication_window"]
+        self.assertEqual(w["highest"], 64)
+        self.assertEqual(w["lower_bound"], 1)
+        self.assertEqual(t["distance"], 64)
+        self.assertFalse(t["bit_evidence"]["within_window"])
+        self.assertEqual(t["bit_evidence"]["bit_value"], None)
+        self.assertIsNone(t["originator"])
+        self.assertFalse(t["traceable_placeholder"])
+
+    def test_sliding_window_cannot_overwrite_frozen_duplicate_trace(self):
+        v = self._audit([
+            appdata(SECRET3, 3, 0, b"a"),
+            appdata(SECRET3, 3, 0, b"a"),   # duplicate at highest 0
+            appdata(SECRET3, 3, 100, b"b"),  # slides the old bit out
+        ])
+        # the final window no longer covers seq 0...
+        self.assertEqual(v["final_state"]["epochs"][-1]["highest"], 100)
+        # ...but the frozen trace of record #1 keeps its original verdict
+        t = v["records"][1]["trace"]
+        self.assertEqual(t["replay"], "duplicate")
+        self.assertEqual(t["adjudication_window"]["highest"], 0)
+        self.assertEqual(t["adjudication_window"]["bitmap"], "0000000000000001")
+        self.assertEqual(t["distance"], 0)
+        self.assertEqual(t["bit_evidence"]["bit_value"], 1)
+        self.assertEqual(t["originator"]["record_index"], 0)
+        self.assertTrue(t["traceable_placeholder"])
+
+    def test_new_record_has_no_traceable_placeholder(self):
+        v = self._audit([appdata(SECRET3, 3, 7, b"a")])
+        t = v["records"][0]["trace"]
+        self.assertEqual(t["replay"], "new")
+        self.assertEqual(t["auth"], "ok")
+        self.assertIsNone(t["originator"])
+        self.assertFalse(t["traceable_placeholder"])
+        self.assertEqual(t["adjudication_window"]["highest"], -1)
+
+    def test_authentication_failure_has_no_traceable_placeholder(self):
+        tampered = bytearray(appdata(SECRET3, 3, 2, b"y"))
+        tampered[-1] ^= 1
+        v = self._audit([
+            appdata(SECRET3, 3, 64, b"x"),
+            bytes(tampered),                 # new bit, but AEAD fails
+            appdata(SECRET3, 3, 2, b"y"),   # still new afterwards
+        ])
+        t = v["records"][1]["trace"]
+        self.assertEqual(t["replay"], "new")
+        self.assertEqual(t["auth"], "failed")
+        self.assertEqual(t["bit_evidence"]["bit_value"], 0)
+        self.assertIsNone(t["originator"])
+        self.assertFalse(t["traceable_placeholder"])
+        # the genuine record arriving later is still new
+        self.assertEqual(v["records"][2]["trace"]["replay"], "new")
+
+    def test_traces_do_not_change_existing_verdict_fields(self):
+        v = self._audit([
+            appdata(SECRET3, 3, 0, b"a"),
+            key_update_record(SECRET3, 3, 1),
+        ])
+        self.assertTrue(v["ok"])
+        self.assertIsNone(v["first_violation"])
+        self.assertEqual(v["final_state"]["current_epoch"], 4)
+        self.assertEqual(v["final_state"]["ratchets"], 1)
+        for r in v["records"]:
+            for key in ("index", "epoch", "seq", "replay", "auth",
+                        "window_before", "window_after", "violation"):
+                self.assertIn(key, r)
+            self.assertIn("trace", r)
 
 
 if __name__ == "__main__":

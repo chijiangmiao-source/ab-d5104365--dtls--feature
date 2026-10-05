@@ -46,6 +46,25 @@
   .tag.fail { background: #33131c; color: #ffb3c0; }
   .tag.skip { background: #1a1f2e; color: #7f8db3; }
   .tag.okb  { background: #0f2f1e; color: #8ff0b8; }
+  #tracebar { margin: 0 0 12px; display: flex; gap: 10px; align-items: center;
+              flex-wrap: wrap; font-size: 12.5px; color: #9db4e8; }
+  #tracebar select { width: auto; min-width: 320px; background: #0b1226;
+                     color: #dbe4ff; border: 1px solid #33406b; border-radius: 6px;
+                     padding: 7px; font-family: ui-monospace, Consolas, monospace;
+                     font-size: 12px; }
+  #tracebar button { margin-top: 0; padding: 7px 14px; }
+  #trace-out { border: 1px solid #26314f; border-radius: 8px; background: #0e1528;
+               padding: 12px 14px; margin-bottom: 12px; font-size: 12.5px;
+               white-space: pre-wrap; line-height: 1.65; }
+  #trace-out.empty { color: #6f80ab; }
+  #trace-out .k { color: #9db4e8; }
+  #trace-out .v { color: #dbe4ff; }
+  #trace-out .yes { color: #8ff0b8; }
+  #trace-out .no { color: #ffd27a; }
+  #trace-out .err { color: #ff9090; }
+  .tracebtn { background: #24304f; color: #cdd9ff; border: 0; border-radius: 4px;
+              padding: 1px 7px; font-size: 10.5px; cursor: pointer; margin-left: 5px; }
+  .tracebtn:hover { background: #33406b; }
 </style>
 </head>
 <body>
@@ -89,6 +108,13 @@
   </div>
   <div id="v-banner" class="banner"></div>
   <div id="v-final" class="final"></div>
+  <div id="tracebar" hidden>
+    <label for="trace-select" style="margin:0">追溯记录占位证据：</label>
+    <select id="trace-select"></select>
+    <button id="trace-go">经接口追溯</button>
+    <span id="trace-status" style="color:#6f80ab"></span>
+  </div>
+  <div id="trace-out" class="empty" hidden></div>
   <div class="tablewrap">
     <table>
       <thead>
@@ -123,6 +149,12 @@ function clearResult() {
   $("v-rows").innerHTML = "";
   $("v-audit").textContent = "";
   $("v-created").textContent = "";
+  $("tracebar").hidden = true;
+  $("trace-select").innerHTML = "";
+  $("trace-out").hidden = true;
+  $("trace-out").textContent = "";
+  $("trace-out").className = "empty";
+  $("trace-status").textContent = "";
 }
 
 function showError(msg) {
@@ -137,6 +169,7 @@ function winText(w) {
 
 function renderVerdict(v) {
   clearResult();
+  currentAuditId = v.audit_id;
   $("error").textContent = "";
   $("v-audit").textContent = v.audit_id;
   $("v-created").textContent = "冻结于 " + v.created_at;
@@ -181,12 +214,26 @@ function renderVerdict(v) {
       ? `${KIND_ZH[r.violation.kind] || r.violation.kind} @${r.violation.offset}：${esc(r.violation.message)}`
       : "—";
     return `<tr class="${r.violation ? "violation" : ""}">` +
-      `<td>${r.index}</td><td>${r.raw_length}</td><td>${esc(hdr)}</td>` +
+      `<td>${r.index}<button class="tracebtn" data-index="${r.index}">追溯</button></td>` +
+      `<td>${r.raw_length}</td><td>${esc(hdr)}</td>` +
       `<td>${r.epoch ?? "—"}</td><td>${r.seq ?? "—"}</td>` +
       `<td>${replay}</td><td>${auth}</td><td>${inner}</td>` +
       `<td>${digest}</td><td>${win}</td><td>${viol}</td></tr>`;
   }).join("");
   $("v-rows").innerHTML = rows;
+  // Populate the trace selector only with records that actually appeared.
+  const sel = $("trace-select");
+  sel.innerHTML = v.records.map(r => {
+    const label = `#${r.index}` +
+      (r.epoch !== null && r.epoch !== undefined ? ` · epoch ${r.epoch}` : "") +
+      (r.seq !== null && r.seq !== undefined ? ` · 序号 ${r.seq}` : "") +
+      (r.replay ? ` · ${REPLAY_ZH[r.replay] || r.replay}` : " · 未裁定");
+    return `<option value="${r.index}">${esc(label)}</option>`;
+  }).join("");
+  $("tracebar").hidden = false;
+  $("trace-out").hidden = true;
+  $("trace-out").textContent = "";
+  $("trace-status").textContent = "";
   $("result").hidden = false;
   $("result").scrollIntoView({behavior: "smooth", block: "start"});
 }
@@ -246,6 +293,85 @@ async function reopenAudit() {
 
 $("submit").addEventListener("click", submitAudit);
 $("reopen").addEventListener("click", reopenAudit);
+
+let currentAuditId = null;
+
+async function traceRecord(index) {
+  if (currentAuditId === null) return;
+  $("trace-select").value = String(index);
+  $("trace-status").textContent = "查询中…";
+  let resp;
+  try {
+    resp = await fetch(`/api/audit/${encodeURIComponent(currentAuditId)}/record/${index}/trace`);
+  } catch (e) {
+    renderTraceError("网络错误：" + e);
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    renderTraceError("追溯接口拒绝：" +
+      (data && data.detail ? data.detail : resp.status));
+    return;
+  }
+  $("trace-status").textContent = "已从冻结快照取回";
+  renderTrace(data.trace);
+}
+
+function renderTraceError(msg) {
+  const out = $("trace-out");
+  out.hidden = false;
+  out.className = "";
+  out.innerHTML = `<span class="err">${esc(msg)}</span>`;
+  $("trace-status").textContent = "";
+}
+
+function renderTrace(t) {
+  const out = $("trace-out");
+  out.hidden = false;
+  out.className = "";
+  const w = t.adjudication_window;
+  const b = t.bit_evidence;
+  const o = t.originator;
+  const lines = [];
+  lines.push(`<span class="k">记录 #${t.record_index}</span> · epoch <span class="v">${t.epoch ?? "—"}</span>` +
+    ` · 恢复后完整序号 <span class="v">${t.seq ?? "—"}</span>` +
+    ` · 重放裁定 <span class="v">${REPLAY_ZH[t.replay] || t.replay || "未裁定"}</span>` +
+    ` · 认证 <span class="v">${AUTH_ZH[t.auth] || t.auth || "—"}</span>`);
+  if (w) {
+    lines.push(`<span class="k">裁决时窗口快照（冻结时逐记录快照，非最终窗口倒推）：</span>` +
+      `epoch <span class="v">${w.epoch}</span> · 当时最高序号 <span class="v">${w.highest}</span>` +
+      ` · 位图 <span class="v">0x${w.bitmap}</span> · 窗口下界 <span class="v">${w.lower_bound}</span>`);
+    if (t.distance !== null) {
+      lines.push(`<span class="k">与最高序号相差：</span><span class="v">${t.distance}</span>`);
+    }
+  }
+  if (b) {
+    if (b.within_window) {
+      lines.push(`<span class="k">对应窗口位：</span>偏移 <span class="v">${b.bit_offset}</span>` +
+        `（最高序号 − 本序号），该位在冻结位图中为 <span class="v">${b.bit_value}</span>`);
+    } else {
+      lines.push(`<span class="k">对应窗口位：</span>偏移 <span class="v">${b.bit_offset}</span>` +
+        ` 已在 ${b.window_size} 位窗口之外，<span class="no">无位可查，不提供任何占位记录</span>`);
+    }
+  }
+  if (o) {
+    lines.push(`<span class="k yes">可追溯占位（重复）：</span>最先使该位有效的原始记录 ` +
+      `#<span class="v">${o.record_index}</span>（epoch ${o.epoch}，完整序号 ${o.seq}，` +
+      `认证结果 <span class="yes">${AUTH_ZH[o.auth] || o.auth}</span>）`);
+  } else if (t.traceable_placeholder === false && t.replay === "duplicate") {
+    lines.push(`<span class="no">未能在本提交中定位该位的已认证原始记录。</span>`);
+  }
+  lines.push(`<span class="k">结论：</span>${esc(t.explanation)}`);
+  out.innerHTML = lines.join("\n");
+}
+
+$("trace-go").addEventListener("click", () => {
+  traceRecord(Number($("trace-select").value));
+});
+$("v-rows").addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".tracebtn");
+  if (btn) traceRecord(Number(btn.dataset.index));
+});
 </script>
 </body>
 </html>

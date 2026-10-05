@@ -81,3 +81,32 @@ def reopen_audit(audit_id: str) -> dict:
     if verdict is None:
         raise HTTPException(404, "no frozen verdict for this audit id")
     return verdict
+
+
+@app.get("/api/audit/{audit_id}/record/{record_index}/trace")
+def trace_record(audit_id: str, record_index: int) -> dict:
+    """Return the frozen placeholder evidence for one adjudicated record.
+
+    The evidence is read back from the per-record snapshot frozen at
+    submission time; it is never recomputed from the final receive window,
+    so slides that later pushed old bits out cannot rewrite an old verdict.
+    """
+    verdict = VERDICTS.get(audit_id)
+    if verdict is None:
+        raise HTTPException(404, "no frozen verdict for this audit id")
+    records = verdict.get("records", [])
+    if record_index < 0 or record_index >= len(records):
+        raise HTTPException(
+            404,
+            f"record index {record_index} does not appear in frozen verdict "
+            f"'{audit_id}' (0..{len(records) - 1})",
+        )
+    row = records[record_index]
+    trace = row.get("trace")
+    if trace is None:  # verdicts frozen before traceability existed
+        raise HTTPException(404, "no frozen trace evidence for this record")
+    return {
+        "audit_id": audit_id,
+        "record_count": len(records),
+        "trace": trace,
+    }

@@ -227,6 +227,126 @@ def smoke_tests():
           status == 200 and fv.get("kind") == "length" and fv.get("offset") == 3,
           f"{status} {fv}")
 
+    # --- scenario E: frozen placeholder traceability via the real API ---
+    # records: #0 seq0 new, #1 seq0 duplicate, #2 seq100 new (window slides
+    # and pushes the seq0 bit out), #3 seq0 too old, #4 seq36 (offset 64
+    # -> too old relative to highest 100), #5 seq37 (offset 63) new but
+    # with a corrupted tag.
+    tampered = bytearray(app(37))
+    tampered[-1] ^= 1
+    records = [
+        app(0),
+        app(0),
+        app(100),
+        app(0),
+        app(36),
+        bytes(tampered),
+    ]
+    status, v = post_audit("smoke-trace", secret_hex, records)
+    if status != 200:
+        check("trace: submission accepted", False, f"status {status}")
+    else:
+        def trace(index):
+            return http("GET", f"/api/audit/smoke-trace/record/{index}/trace")
+
+        # duplicate: real interface names the first authenticated originator
+        st, body = trace(1)
+        t = (body or {}).get("trace", {})
+        ok = (st == 200 and t.get("replay") == "duplicate"
+              and t.get("epoch") == 3 and t.get("seq") == 0
+              and t.get("auth") == "skipped")
+        check("trace: duplicate returns recovered seq/epoch/adjudication",
+              ok, f"{st} {json.dumps(body)[:240]}" if not ok else "")
+        check("trace: duplicate bit evidence at adjudication time",
+              t.get("adjudication_window", {}).get("highest") == 0
+              and t.get("distance") == 0
+              and (t.get("bit_evidence") or {}).get("bit_offset") == 0
+              and (t.get("bit_evidence") or {}).get("bit_value") == 1,
+              json.dumps(t)[:240])
+        check("trace: duplicate names first authenticated originator",
+              (t.get("originator") or {}).get("record_index") == 0
+              and t["originator"].get("seq") == 0
+              and t["originator"].get("auth") == "ok"
+              and t.get("traceable_placeholder") is True,
+              json.dumps(t)[:240])
+
+        # after the window slides, requerying the earlier duplicate must
+        # still answer from the frozen snapshot rather than the final window
+        st, body2 = trace(1)
+        t2 = (body2 or {}).get("trace", {})
+        check("trace: window slide does not overwrite frozen duplicate",
+              st == 200
+              and t2.get("replay") == "duplicate"
+              and t2.get("adjudication_window", {}).get("highest") == 0
+              and t2.get("adjudication_window", {}).get("bitmap") ==
+                  "0000000000000001"
+              and v["final_state"]["epochs"][-1]["highest"] == 100
+              and t2 == t,
+              f"final highest=100 but trace={json.dumps(t2)[:200]}")
+
+        # too old: highest, distance and window lower bound; no placeholder
+        st, body = trace(3)
+        t = (body or {}).get("trace", {})
+        check("trace: too-old gives highest/distance/lower bound",
+              st == 200 and t.get("replay") == "too_old"
+              and t.get("adjudication_window", {}).get("highest") == 100
+              and t.get("distance") == 100
+              and t.get("adjudication_window", {}).get("lower_bound") == 37,
+              json.dumps(t)[:240])
+        check("trace: too-old fabricates no placeholder record",
+              (t.get("bit_evidence") or {}).get("within_window") is False
+              and t.get("originator") is None
+              and t.get("traceable_placeholder") is False,
+              json.dumps(t)[:240])
+
+        # the offset-64 boundary record: lower bound 37 means seq 36 is out
+        st, body = trace(4)
+        t = (body or {}).get("trace", {})
+        check("trace: offset 64 beyond window lower bound 37",
+              st == 200 and t.get("replay") == "too_old"
+              and t.get("distance") == 64
+              and t.get("adjudication_window", {}).get("lower_bound") == 37
+              and t.get("bit_evidence", {}).get("bit_value") is None,
+              json.dumps(t)[:240])
+
+        # authentication failure: adjudicated new, but no placeholder exists
+        st, body = trace(5)
+        t = (body or {}).get("trace", {})
+        check("trace: failed-auth record has no traceable placeholder",
+              st == 200 and t.get("replay") == "new" and t.get("auth") == "failed"
+              and (t.get("bit_evidence") or {}).get("bit_offset") == 63
+              and (t.get("bit_evidence") or {}).get("bit_value") == 0
+              and t.get("originator") is None
+              and t.get("traceable_placeholder") is False,
+              json.dumps(t)[:240])
+
+        # the fresh record likewise has no placeholder to trace
+        st, body = trace(0)
+        t = (body or {}).get("trace", {})
+        check("trace: new record explicitly has no placeholder",
+              st == 200 and t.get("replay") == "new"
+              and t.get("traceable_placeholder") is False
+              and t.get("originator") is None,
+              json.dumps(t)[:200])
+
+        # frozen evidence survives reopening by audit id
+        st, reopened = http("GET", "/api/audit/smoke-trace")
+        st2, body = trace(1)
+        check("trace: evidence intact after verdict reopen",
+              st == 200 and reopened.get("record_count") == 6
+              and st2 == 200
+              and (body.get("trace") or {}).get("replay") == "duplicate",
+              f"{st} {st2}")
+
+        # error paths: unknown audit id and out-of-range / negative index
+        st, body = http("GET", "/api/audit/no-such-audit/record/0/trace")
+        check("trace: unknown audit id is 404", st == 404, f"status {st}")
+        st, body = trace(99)
+        check("trace: out-of-range index is 404", st == 404, f"status {st}")
+        st, body = http("GET", "/api/audit/smoke-trace/record/-1/trace")
+        # FastAPI rejects the negative segment as a different route -> 404
+        check("trace: negative index not accepted", st == 404, f"status {st}")
+
 
 def main():
     print(f"[verify] acceptance run, target {APP_BASE}")
