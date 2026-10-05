@@ -12,6 +12,7 @@ from server.dtls import (
     Violation,
     parse_unified_header,
     reconstruct_seq,
+    run_audit,
 )
 from server.encode import key_update_record, seal_record
 
@@ -272,6 +273,65 @@ class ReceiverRuleTests(unittest.TestCase):
         row = rx.process_record(rec)
         self.assertEqual(row["violation"]["kind"], "authentication")
         self.assertIsNone(row["inner_type"])
+
+
+class TraceEvidenceTests(unittest.TestCase):
+    def test_duplicate_trace_names_first_authenticating_record(self):
+        verdict = run_audit(3, SECRET3, [appdata(SECRET3, 3, 5, b"a"),
+                                         appdata(SECRET3, 3, 5, b"a")])
+        trace = verdict["records"][1]["trace"]
+        self.assertEqual(trace["replay"], "duplicate")
+        self.assertEqual(trace["epoch"], 3)
+        self.assertEqual(trace["seq"], 5)
+        self.assertEqual(trace["highest_at_decision"], 5)
+        self.assertEqual(trace["bit_offset"], 0)
+        self.assertEqual(trace["bit_value"], 1)
+        self.assertEqual(trace["placeholder"]["first_set_by"],
+                         {"record_index": 0, "seq": 5, "auth": "ok"})
+
+    def test_too_old_trace_has_bounds_and_no_placeholder(self):
+        verdict = run_audit(3, SECRET3, [appdata(SECRET3, 3, 64, b"a"),
+                                         appdata(SECRET3, 3, 0, b"a")])
+        trace = verdict["records"][1]["trace"]
+        self.assertEqual(trace["replay"], "too_old")
+        self.assertEqual(trace["highest_at_decision"], 64)
+        self.assertEqual(trace["gap"], 64)
+        self.assertEqual(trace["window_lowest"], 1)
+        self.assertIsNone(trace["placeholder"])
+
+    def test_new_and_failed_records_have_no_placeholder(self):
+        good = appdata(SECRET3, 3, 0, b"a")
+        bad = bytearray(appdata(SECRET3, 3, 1, b"b"))
+        bad[-1] ^= 1
+        verdict = run_audit(3, SECRET3, [good, bytes(bad)])
+        new_trace = verdict["records"][0]["trace"]
+        failed_trace = verdict["records"][1]["trace"]
+        self.assertEqual(new_trace["replay"], "new")
+        self.assertIsNone(new_trace["placeholder"])
+        self.assertEqual(failed_trace["replay"], "new")
+        self.assertIsNone(failed_trace["placeholder"])
+        self.assertIn("authentication", failed_trace["note"])
+
+    def test_shifted_window_keeps_frozen_decision(self):
+        records = [appdata(SECRET3, 3, 0, b"a"),
+                   appdata(SECRET3, 3, 0, b"a"),
+                   appdata(SECRET3, 3, 70, b"b")]
+        verdict = run_audit(3, SECRET3, records)
+        # the jump to 70 evicts the seq-0 bit from the final window...
+        self.assertEqual(verdict["final_state"]["epochs"][0]["highest"], 70)
+        # ...yet the frozen duplicate adjudication and its placeholder
+        # evidence must still reflect decision time, not the final window
+        trace = verdict["records"][1]["trace"]
+        self.assertEqual(trace["replay"], "duplicate")
+        self.assertEqual(trace["highest_at_decision"], 0)
+        self.assertEqual(trace["placeholder"]["first_set_by"]["record_index"], 0)
+
+    def test_unparsed_record_trace_has_no_placeholder(self):
+        verdict = run_audit(3, SECRET3, [b"\x40\x00"])  # not a unified header
+        trace = verdict["records"][0]["trace"]
+        self.assertIsNone(trace["epoch"])
+        self.assertIsNone(trace["placeholder"])
+        self.assertIn("never reached", trace["note"])
 
 
 if __name__ == "__main__":

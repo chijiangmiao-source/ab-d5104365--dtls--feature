@@ -11,6 +11,11 @@ adjudicates every record as new / duplicate / too_old. A legal KeyUpdate is
 authenticated first and only then ratchets the secret into the next epoch and
 resets the receive window. Failed, duplicate, or old-epoch records never
 advance secrets or the current window.
+
+Every adjudication also freezes per-record trace evidence (decision-time
+highest sequence number, window-bit placeholder attribution, or too-old
+bounds) so a duplicate/too-old verdict can be traced later from the frozen
+snapshot instead of being back-computed from the final window.
 """
 from __future__ import annotations
 
@@ -397,16 +402,100 @@ class Receiver:
         }
 
 
+def build_trace(row: dict, attribution: dict) -> dict:
+    """Frozen per-record traceability evidence for the replay adjudication.
+
+    Everything is derived from the decision-time window snapshot
+    (``window_before``) and from the attribution of previously authenticated
+    records — never from the final window — so later window shifts cannot
+    rewrite the history of an earlier adjudication.
+    """
+    trace = {
+        "epoch": row["epoch"],
+        "seq": row["seq"],
+        "replay": row["replay"],
+        "auth": row["auth"],
+        "violation": row["violation"],
+        "highest_at_decision": None,
+        "bitmap_at_decision": None,
+        "gap": None,
+        "window_lowest": None,
+        "bit_offset": None,
+        "bit_value": None,
+        "placeholder": None,
+        "note": None,
+    }
+    win = row["window_before"]
+    if row["epoch"] is None or row["seq"] is None or win is None:
+        trace["note"] = ("record never reached replay adjudication; "
+                         "no window placeholder to trace")
+        return trace
+    highest = win["highest"]
+    gap = highest - row["seq"]
+    trace["highest_at_decision"] = highest
+    trace["bitmap_at_decision"] = win["bitmap"]
+    trace["gap"] = gap
+    trace["window_lowest"] = max(0, highest - (WINDOW_BITS - 1))
+    if 0 <= gap < WINDOW_BITS:
+        trace["bit_offset"] = gap
+        trace["bit_value"] = (int(win["bitmap"], 16) >> gap) & 1
+    replay = row["replay"]
+    if replay == "duplicate":
+        # The bit was already set at decision time: name the first record
+        # that authenticated this sequence number (always an earlier row).
+        setter = attribution.get((row["epoch"], row["seq"]))
+        trace["placeholder"] = {
+            "bit_offset": gap,
+            "bit_value": 1,
+            "first_set_by": setter,
+        }
+        trace["note"] = (
+            f"duplicate: window bit {gap} was already set at decision time; "
+            "placeholder evidence names the first record that authenticated "
+            "this sequence number")
+    elif replay == "too_old":
+        # Beyond the window: report the bounds, fabricate no placeholder.
+        trace["note"] = (
+            f"too_old: sequence is {gap} below the highest sequence number "
+            f"at decision time, past the {WINDOW_BITS}-bit window (lower "
+            f"bound {trace['window_lowest']}); no placeholder record exists")
+    elif row["auth"] == "ok":
+        trace["note"] = ("new: this record itself first occupied the window "
+                         "bit; no duplicate placeholder to trace")
+    elif row["violation"] is not None:
+        if row["violation"]["kind"] == KIND_AUTHENTICATION:
+            trace["note"] = ("authentication failed: the record never "
+                             "occupied a window bit; no duplicate "
+                             "placeholder to trace")
+        else:
+            trace["note"] = (f"record failed {row['violation']['kind']} "
+                             "checks and never occupied a window bit; no "
+                             "duplicate placeholder to trace")
+    else:
+        trace["note"] = "new: no duplicate placeholder to trace"
+    return trace
+
+
 def run_audit(initial_epoch: int, traffic_secret: bytes,
               record_blobs: list[bytes]) -> dict:
     """Adjudicate a captured record sequence and produce the frozen verdict."""
     receiver = Receiver(initial_epoch, traffic_secret)
     rows = []
     first_violation = None
+    attribution = {}  # (epoch, seq) -> first authenticated occupant record
     for index, blob in enumerate(record_blobs):
         row = receiver.process_record(blob)
         row["index"] = index
+        row["trace"] = build_trace(row, attribution)
         rows.append(row)
+        if row["auth"] == "ok" and row["replay"] == "new":
+            # Only authenticated new records occupy a window bit; the first
+            # occupant is the placeholder evidence for later duplicates.
+            attribution.setdefault((row["epoch"], row["seq"]), {
+                "record_index": index,
+                "seq": row["seq"],
+                "auth": row["auth"],
+            })
         if row["violation"] is not None and first_violation is None:
             first_violation = {"record_index": index, **row["violation"]}
     return {

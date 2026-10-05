@@ -46,6 +46,14 @@
   .tag.fail { background: #33131c; color: #ffb3c0; }
   .tag.skip { background: #1a1f2e; color: #7f8db3; }
   .tag.okb  { background: #0f2f1e; color: #8ff0b8; }
+  .tracebtn { margin-top: 0; padding: 2px 8px; font-size: 11px; background: #22315c; }
+  .tracebtn:hover { background: #2f6fed; }
+  #result p.hint { font-size: 11.5px; color: #6f80ab; margin: 0 0 8px; }
+  #trace-panel { border: 1px solid #2f6fed; border-radius: 8px; margin-top: 12px;
+                 padding: 10px 14px; font-size: 12px; background: #101a33;
+                 font-family: ui-monospace, Consolas, monospace; }
+  #trace-panel h3 { margin: 0 0 6px; font-size: 13px; color: #9db4e8; }
+  #trace-panel div { margin: 2px 0; }
 </style>
 </head>
 <body>
@@ -89,6 +97,7 @@
   </div>
   <div id="v-banner" class="banner"></div>
   <div id="v-final" class="final"></div>
+  <p class="hint">点击行尾「追溯」经 API 查看该记录裁定的占位证据（重复 / 过旧 / 新到）。</p>
   <div class="tablewrap">
     <table>
       <thead>
@@ -96,11 +105,13 @@
           <th>#</th><th>原始长度</th><th>头部 (S/L/E/截断序号)</th><th>epoch</th>
           <th>完整序号</th><th>重放裁定</th><th>认证</th><th>内部类型</th>
           <th>应用数据摘要 (SHA-256)</th><th>重放窗口 前 → 后</th><th>违规（类型 @ 原始偏移）</th>
+          <th>追溯</th>
         </tr>
       </thead>
       <tbody id="v-rows"></tbody>
     </table>
   </div>
+  <div id="trace-panel" hidden></div>
 </section>
 
 <script>
@@ -108,6 +119,7 @@ const $ = (id) => document.getElementById(id);
 const KIND_ZH = {truncation: "截断", length: "长度", authentication: "认证", state: "状态"};
 const REPLAY_ZH = {new: "新到", duplicate: "重复", too_old: "过旧"};
 const AUTH_ZH = {ok: "通过", failed: "失败", skipped: "跳过"};
+let currentAuditId = null;
 
 function esc(s) {
   return String(s).replace(/[&<>"]/g,
@@ -123,6 +135,9 @@ function clearResult() {
   $("v-rows").innerHTML = "";
   $("v-audit").textContent = "";
   $("v-created").textContent = "";
+  $("trace-panel").hidden = true;
+  $("trace-panel").innerHTML = "";
+  currentAuditId = null;
 }
 
 function showError(msg) {
@@ -138,6 +153,7 @@ function winText(w) {
 function renderVerdict(v) {
   clearResult();
   $("error").textContent = "";
+  currentAuditId = v.audit_id;
   $("v-audit").textContent = v.audit_id;
   $("v-created").textContent = "冻结于 " + v.created_at;
   const banner = $("v-banner");
@@ -184,11 +200,58 @@ function renderVerdict(v) {
       `<td>${r.index}</td><td>${r.raw_length}</td><td>${esc(hdr)}</td>` +
       `<td>${r.epoch ?? "—"}</td><td>${r.seq ?? "—"}</td>` +
       `<td>${replay}</td><td>${auth}</td><td>${inner}</td>` +
-      `<td>${digest}</td><td>${win}</td><td>${viol}</td></tr>`;
+      `<td>${digest}</td><td>${win}</td><td>${viol}</td>` +
+      `<td><button type="button" class="tracebtn" data-idx="${r.index}">追溯</button></td></tr>`;
   }).join("");
   $("v-rows").innerHTML = rows;
   $("result").hidden = false;
   $("result").scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+// 单条记录的裁定追溯：经真实 API 取回冻结时的逐记录证据
+async function traceRecord(index) {
+  $("error").textContent = "";
+  if (!currentAuditId) { showError("请先提交或打开一份冻结裁决。"); return; }
+  let resp;
+  try {
+    resp = await fetch("/api/audit/" + encodeURIComponent(currentAuditId) +
+                       "/records/" + index + "/trace");
+  } catch (e) {
+    showError("网络错误：" + e);
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    showError("无法追溯记录：" + (data && data.detail ? data.detail : resp.status));
+    return;
+  }
+  renderTrace(data);
+}
+
+function renderTrace(t) {
+  const panel = $("trace-panel");
+  const replay = t.replay ? (REPLAY_ZH[t.replay] || t.replay) : "—";
+  const auth = t.auth ? (AUTH_ZH[t.auth] || t.auth) : "—";
+  let ph;
+  if (t.placeholder && t.placeholder.first_set_by) {
+    const s = t.placeholder.first_set_by;
+    ph = `窗口位偏移 ${t.placeholder.bit_offset} · 位值 ${t.placeholder.bit_value} · ` +
+         `最先置位记录 #${s.record_index}（序号 ${s.seq} · 认证 ${AUTH_ZH[s.auth] || s.auth}）`;
+  } else {
+    ph = "无占位记录";
+  }
+  panel.innerHTML =
+    `<h3>记录 #${t.record_index} 裁定追溯 · 审计 ${esc(t.audit_id)}</h3>` +
+    `<div>所属 epoch：${t.epoch ?? "—"} · 恢复后完整序号：${t.seq ?? "—"} · ` +
+    `重放裁定：${replay} · 认证：${auth}</div>` +
+    `<div>裁决时最高序号：${t.highest_at_decision ?? "—"} · ` +
+    `裁决时位图：0x${t.bitmap_at_decision || "—"}</div>` +
+    `<div>相差值：${t.gap ?? "—"} · 窗口下界：${t.window_lowest ?? "—"} · ` +
+    `窗口位偏移：${t.bit_offset ?? "—"} · 位值：${t.bit_value ?? "—"}</div>` +
+    `<div>占位证据：${esc(ph)}</div>` +
+    (t.note ? `<div>说明：${esc(t.note)}</div>` : "");
+  panel.hidden = false;
+  panel.scrollIntoView({behavior: "smooth", block: "nearest"});
 }
 
 async function submitAudit() {
@@ -246,6 +309,10 @@ async function reopenAudit() {
 
 $("submit").addEventListener("click", submitAudit);
 $("reopen").addEventListener("click", reopenAudit);
+$("v-rows").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button.tracebtn");
+  if (btn) traceRecord(Number(btn.dataset.idx));
+});
 </script>
 </body>
 </html>

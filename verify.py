@@ -4,8 +4,10 @@
 Runs, in order:
   1. build checks        — byte-compile the app, import it, sanity-check the page
   2. review-rule tests   — the unittest suite (replay window, KeyUpdate, vectors)
-  3. HTTP smoke tests    — live API checks of the KeyUpdate ratchet and the
-                           replay-window boundary against APP_BASE_URL
+  3. HTTP smoke tests    — live API checks of the KeyUpdate ratchet, the
+                           replay-window boundary, and the per-record
+                           duplicate/too-old trace interface against
+                           APP_BASE_URL
 
 Exits 0 when every check passes, 1 otherwise, so `docker compose up
 --exit-code-from verify` reports the acceptance result as its status code.
@@ -226,6 +228,88 @@ def smoke_tests():
     check("length: kind and raw offset reported",
           status == 200 and fv.get("kind") == "length" and fv.get("offset") == 3,
           f"{status} {fv}")
+
+    # --- scenario E: duplicate / too-old traceability across a window shift ---
+    records = [
+        app(0),                 # 0: new, first occupies the bit for seq 0
+        app(0),                 # 1: duplicate of seq 0
+        app(2),                 # 2: new
+        app(3, tamper=True),    # 3: AEAD failure, never occupies a bit
+        app(70),                # 4: new; 68-step shift evicts the seq 0/2 bits
+        app(0),                 # 5: offset 70 -> too old
+        app(69),                # 6: offset 1 -> new
+        app(70),                # 7: duplicate of seq 70
+    ]
+    status, v = post_audit("smoke-trace", secret_hex, records)
+    if status != 200:
+        check("trace: submission accepted", False, f"status {status}")
+    else:
+        check("trace: tampered record flags the verdict", v.get("ok") is False)
+
+        def trace(idx, audit_id="smoke-trace"):
+            return http("GET", f"/api/audit/{audit_id}/records/{idx}/trace")
+
+        status, t = trace(1)
+        ok = (status == 200 and t.get("replay") == "duplicate"
+              and t.get("epoch") == 3 and t.get("seq") == 0
+              and t.get("highest_at_decision") == 0
+              and t.get("bit_offset") == 0 and t.get("bit_value") == 1)
+        check("trace: duplicate resolved against decision-time window", ok,
+              f"{status} {json.dumps(t)[:300]}" if not ok else "")
+        setter = ((t or {}).get("placeholder") or {}).get("first_set_by") or {}
+        check("trace: duplicate placeholder names first authenticating record",
+              setter.get("record_index") == 0 and setter.get("seq") == 0
+              and setter.get("auth") == "ok", json.dumps(setter))
+
+        status, t = trace(5)
+        ok = (status == 200 and t.get("replay") == "too_old"
+              and t.get("highest_at_decision") == 70 and t.get("gap") == 70
+              and t.get("window_lowest") == 7)
+        check("trace: too-old reports highest, gap and window lower bound", ok,
+              f"{status} {json.dumps(t)[:300]}" if not ok else "")
+        check("trace: too-old fabricates no placeholder record",
+              status == 200 and t.get("placeholder") is None)
+
+        # the seq-0/2 bits were evicted by the jump to 70; the frozen
+        # per-record snapshot must still answer, not the final window
+        status, t = trace(0)
+        check("trace: evicted bit keeps frozen decision (no final-window backfill)",
+              status == 200 and t.get("replay") == "new"
+              and t.get("highest_at_decision") == -1
+              and t.get("placeholder") is None,
+              f"{status} {json.dumps(t)[:300]}")
+        status, t = trace(2)
+        check("trace: evicted new record keeps decision-time highest",
+              status == 200 and t.get("replay") == "new"
+              and t.get("highest_at_decision") == 0
+              and t.get("placeholder") is None,
+              f"{status} {json.dumps(t)[:300]}")
+
+        status, t = trace(3)
+        check("trace: authentication failure has no traceable placeholder",
+              status == 200 and t.get("replay") == "new"
+              and t.get("placeholder") is None and bool(t.get("note")),
+              f"{status} {json.dumps(t)[:300]}")
+
+        status, t = trace(6)
+        check("trace: in-window new record shows unset bit at decision",
+              status == 200 and t.get("bit_offset") == 1
+              and t.get("bit_value") == 0 and t.get("placeholder") is None,
+              f"{status} {json.dumps(t)[:300]}")
+
+        status, t = trace(7)
+        setter = ((t or {}).get("placeholder") or {}).get("first_set_by") or {}
+        check("trace: post-shift duplicate traces to its original record",
+              status == 200 and t.get("highest_at_decision") == 70
+              and setter.get("record_index") == 4 and setter.get("auth") == "ok",
+              f"{status} {json.dumps(t)[:300]}")
+
+        status, _ = trace(8)
+        check("trace: out-of-range record index rejected", status == 404,
+              f"status {status}")
+        status, _ = trace(0, audit_id="smoke-missing")
+        check("trace: unknown audit id rejected", status == 404,
+              f"status {status}")
 
 
 def main():

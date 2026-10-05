@@ -15,6 +15,8 @@ KeyUpdate 不会被当作新的有效指令。
 - **合法 KeyUpdate 先经认证**，再派生下一 epoch 密钥（`"traffic upd"`）并重置窗口；
   失败、重复或旧 epoch 记录绝不推进秘密或当前窗口（旧 epoch 记录只更新其自身
   epoch 的重放状态，用于识别迟到的重放）
+- 重复 / 过旧裁定支持**逐记录追溯**：裁决时最高序号、窗口位占位证据
+  （首位置位记录及其认证结果）或过旧边界（最高序号、相差值、窗口下界）
 
 ## 运行
 
@@ -26,7 +28,8 @@ HOST_PORT=9000 docker compose up app  # 可配置宿主机端口
 打开 `http://localhost:8080/`：填写审计标识、初始 epoch、64 位十六进制
 traffic secret，按捕获顺序粘贴至多 48 条 Base64 记录并提交；之后可用同一
 审计标识重新打开冻结裁决。每条记录显示 epoch、完整序号、认证结果、重放窗口
-前后状态与应用数据摘要（SHA-256）；存在违规时页面经 API 显示首个截断 / 长度 /
+前后状态与应用数据摘要（SHA-256）；点击行尾「追溯」可经 API 查看该记录裁定
+的占位证据（见下文「裁定追溯」）。存在违规时页面经 API 显示首个截断 / 长度 /
 认证 / 状态违规的**原始偏移**（记录内字节偏移），同一审计标识再次提交会原子
 替换旧裁决，旧成功证据随之清除。
 
@@ -43,7 +46,8 @@ docker compose up --exit-code-from verify
    推进纪律、伪造抵抗、RFC 5869 / AES-GCM 测试向量
 3. **HTTP 冒烟** — 针对运行中的服务验证 KeyUpdate 推进与窗口重置、
    重放边界裁定、伪造 KeyUpdate 不推进秘密、截断/长度违规的原始偏移、
-   以及再次提交后旧成功证据被清除
+   再次提交后旧成功证据被清除，以及重复/过旧追溯接口在窗口位移
+   （旧位被挤出）后仍返回冻结时的逐记录证据
 
 完成后容器退出，退出码即验收结果（0 = 通过，1 = 失败）。
 
@@ -55,6 +59,7 @@ docker compose up --exit-code-from verify
 | `GET` | `/` | 审计页面 |
 | `POST` | `/api/audit` | 提交捕获并冻结裁决（替换同标识旧裁决） |
 | `GET` | `/api/audit/{audit_id}` | 重新打开冻结裁决 |
+| `GET` | `/api/audit/{audit_id}/records/{index}/trace` | 追溯单条记录的重放裁定证据 |
 
 `POST /api/audit` 请求体：
 
@@ -68,8 +73,25 @@ docker compose up --exit-code-from verify
 ```
 
 响应即冻结裁决：`ok`、`first_violation{record_index,kind,offset,message}`、
-逐记录裁定（epoch/seq/replay/auth/窗口前后/摘要/违规）与最终接收状态
+逐记录裁定（epoch/seq/replay/auth/窗口前后/摘要/违规/追溯证据）与最终接收状态
 （当前 epoch、推进次数、各 epoch 窗口）。
+
+## 裁定追溯（trace）
+
+`GET /api/audit/{audit_id}/records/{index}/trace` 依据**冻结时的逐记录快照**
+（裁决当时的窗口状态，而非最终窗口）返回：
+
+- `epoch` / `seq`：记录所属 epoch 与恢复后的完整序号
+- `highest_at_decision` / `bitmap_at_decision`：裁决当时的最高序号与窗口位图
+- `gap` / `window_lowest`：与最高序号的相差值及窗口下界（最高序号 − 63）
+- `bit_offset` / `bit_value`：该序号在裁决时窗口内的位偏移与位值（在窗口内时）
+- `placeholder`：仅**重复**记录存在 —— 给出最先使该位置位的原始记录
+  （`first_set_by{record_index,seq,auth}`）；**过旧**记录只给出上述边界，
+  不伪造占位记录；**新到或认证失败**记录为 `null`，并由 `note` 明确说明
+  没有可追溯的重复占位
+
+窗口前移挤出旧位后，重新查询较早记录仍返回冻结时的原裁决与证据，
+不会以最终窗口倒推覆盖历史。
 
 ## 违规类型与偏移约定
 

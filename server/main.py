@@ -1,9 +1,12 @@
 """Deep-space relay DTLS 1.3 record audit service.
 
 POST /api/audit adjudicates a captured record sequence and freezes the
-verdict; GET /api/audit/{audit_id} reopens the frozen verdict. A new
-submission for the same audit id atomically replaces the previous verdict,
-so stale success evidence is cleared whenever a submission is adjudicated.
+verdict; GET /api/audit/{audit_id} reopens the frozen verdict;
+GET /api/audit/{audit_id}/records/{record_index}/trace returns the frozen
+per-record replay evidence (decision-time highest sequence number, window-bit
+placeholder attribution, or too-old bounds). A new submission for the same
+audit id atomically replaces the previous verdict, so stale success evidence
+is cleared whenever a submission is adjudicated.
 """
 from __future__ import annotations
 
@@ -81,3 +84,21 @@ def reopen_audit(audit_id: str) -> dict:
     if verdict is None:
         raise HTTPException(404, "no frozen verdict for this audit id")
     return verdict
+
+
+@app.get("/api/audit/{audit_id}/records/{record_index}/trace")
+def record_trace(audit_id: str, record_index: int) -> dict:
+    """Trace one record's replay adjudication from the frozen verdict.
+
+    The evidence was frozen per record at adjudication time (decision-time
+    window snapshot), so window shifts caused by later records in the same
+    capture never rewrite the answer for an earlier record.
+    """
+    verdict = VERDICTS.get(audit_id)
+    if verdict is None:
+        raise HTTPException(404, "no frozen verdict for this audit id")
+    records = verdict.get("records", [])
+    if not 0 <= record_index < len(records):
+        raise HTTPException(404, "record index not present in the frozen verdict")
+    trace = dict(records[record_index].get("trace") or {})
+    return {"audit_id": audit_id, "record_index": record_index, **trace}
